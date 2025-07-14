@@ -15,19 +15,16 @@ This project provisions AWS infrastructure using Terraform and deploys a Dockeri
    - `AWS_SECRET_ACCESS_KEY`
 3. **Push to `main` branch** – triggers:
    - Terraform infra deployment
-   - Docker image build & push to ECR
-   - ECS service update with new image
+   - EC2 service update with new image
 
 ## Files
-- `main.tf` – all Terraform resources
-- `Dockerfile` – nginx image customization
-- `html/index.html` – welcome page
-- `.github/workflows/deploy.yml` – CI/CD pipeline
+- `main.tf` – all Terraform resources (in the repo root)
+- `.github/workflows/deploy.yml` – CI/CD pipeline (in `.github/workflows/`)
 
 ## Demo Expectations
 Be ready to:
 - Show GitHub pipeline
-- Show AWS Console: VPC, ECS, ALB
+- Show AWS Console: VPC, EC2, ALB
 - Browse to ALB DNS and see nginx page
 
 ---
