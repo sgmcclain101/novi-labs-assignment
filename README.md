@@ -74,3 +74,12 @@ backend "s3" {
   region = "us-east-1"
 }
 ```
+
+### 4. Final Results
+![Alt text](images/website.png?raw=true)
+![Alt text](images/Screenshot1.png?raw=true)
+![Alt text](images/Screenshot2.png?raw=true)
+![Alt text](images/Screenshot3.png?raw=true)
+![Alt text](images/Screenshot4.png?raw=true)
+![Alt text](images/Screenshot5.png?raw=true)
+![Alt text](images/Screenshot6.png?raw=true)
