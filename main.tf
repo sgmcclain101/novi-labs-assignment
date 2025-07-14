@@ -2,6 +2,22 @@ provider "aws" {
   region = "us-east-1"
 }
 
+# Data source to get the latest ECS-optimized AMI
+data "aws_ami" "ecs_optimized" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-ecs-hvm-*-x86_64-ebs"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.1.2"
@@ -13,7 +29,7 @@ module "vpc" {
   public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
   private_subnets = ["10.0.3.0/24", "10.0.4.0/24"]
 
-  enable_nat_gateway = false
+  enable_nat_gateway = true
   single_nat_gateway = true
 
   tags = {
@@ -26,12 +42,39 @@ module "security_group" {
   version = "5.1.0"
 
   name        = "nginx-sg"
-  description = "Allow HTTP"
+  description = "Allow HTTP and ECS traffic"
   vpc_id      = module.vpc.vpc_id
 
   ingress_rules       = ["http-80-tcp"]
   ingress_cidr_blocks = ["0.0.0.0/0"]
-  egress_rules        = ["all-all"]
+  
+  # Add egress rules for ECS agent communication
+  egress_rules = ["all-all"]
+}
+
+# Additional security group for ECS instances
+resource "aws_security_group" "ecs_instance_sg" {
+  name        = "ecs-instance-sg"
+  description = "Security group for ECS instances"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    from_port       = 32768
+    to_port         = 65535
+    protocol        = "tcp"
+    security_groups = [module.security_group.security_group_id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "ecs-instance-sg"
+  }
 }
 
 resource "aws_iam_role" "ecs_instance_role" {
@@ -57,29 +100,38 @@ resource "aws_iam_instance_profile" "ecs_instance_profile" {
   role = aws_iam_role.ecs_instance_role.name
 }
 
-resource "aws_launch_configuration" "ecs_lc" {
-  name_prefix   = "ecs-lc-"
-  image_id      = "ami-0c02fb55956c7d316" # Amazon Linux 2 ECS-optimized
+resource "aws_launch_template" "ecs_template" {
+  name_prefix   = "ecs-lt-"
+  image_id      = data.aws_ami.ecs_optimized.id
   instance_type = "t3.micro"
-  iam_instance_profile = aws_iam_instance_profile.ecs_instance_profile.name
-  security_groups = [module.security_group.security_group_id]
-  associate_public_ip_address = false
-  user_data = <<-EOF
-              #!/bin/bash
-              echo "ECS_CLUSTER=nginx-cluster" >> /etc/ecs/ecs.config
-              EOF
-  lifecycle {
-    create_before_destroy = true
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ecs_instance_profile.name
   }
+
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = [aws_security_group.ecs_instance_sg.id]
+  }
+
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    echo "ECS_CLUSTER=${aws_ecs_cluster.nginx_cluster.name}" >> /etc/ecs/ecs.config
+  EOF
+  )
 }
 
 resource "aws_autoscaling_group" "ecs_asg" {
-  name_prefix          = "ecs-asg-"
-  max_size             = 1
-  min_size             = 1
-  desired_capacity     = 1
-  vpc_zone_identifier  = module.vpc.private_subnets
-  launch_configuration = aws_launch_configuration.ecs_lc.name
+  name_prefix         = "ecs-asg-"
+  desired_capacity    = 1
+  max_size            = 1
+  min_size            = 1
+  vpc_zone_identifier = module.vpc.private_subnets
+
+  launch_template {
+    id      = aws_launch_template.ecs_template.id
+    version = "$Latest"
+  }
 
   tag {
     key                 = "Name"
@@ -108,8 +160,8 @@ resource "aws_ecs_task_definition" "nginx_task" {
       essential = true
       portMappings = [
         {
-          containerPort = 80
-          hostPort      = 80
+          containerPort = 80,
+          hostPort      = 0  # Use dynamic port mapping
         }
       ]
     }
@@ -131,11 +183,21 @@ resource "aws_lb_target_group" "nginx_tg" {
   protocol    = "HTTP"
   vpc_id      = module.vpc.vpc_id
   target_type = "instance"
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    timeout             = 5
+    interval            = 30
+    path                = "/"
+    matcher             = "200"
+  }
 }
 
 resource "aws_lb_listener" "nginx_listener" {
   load_balancer_arn = aws_lb.nginx_alb.arn
-  port              = 80
+  port              = "80"
   protocol          = "HTTP"
 
   default_action {
@@ -161,6 +223,6 @@ resource "aws_ecs_service" "nginx_service" {
 }
 
 output "alb_dns_name" {
-  value = aws_lb.nginx_alb.dns_name
+  value       = aws_lb.nginx_alb.dns_name
   description = "DNS name of the Application Load Balancer"
 }
