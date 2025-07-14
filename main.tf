@@ -58,7 +58,7 @@ resource "aws_instance" "nginx_ec2" {
               amazon-linux-extras install docker -y
               service docker start
               usermod -a -G docker ec2-user
-              docker run -d -p 80:80 ${aws_ecr_repository.nginx.repository_url}:latest
+              docker run -d -p 80:80 ngnix:latest
               EOF
 
   tags = {
