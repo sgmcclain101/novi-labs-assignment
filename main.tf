@@ -1,13 +1,21 @@
-// main.tf
 provider "aws" {
   region = "us-east-1"
+}
+
+resource "aws_ecr_repository" "nginx" {
+  name                 = "nginx-devops"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
 }
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.1.2"
 
-  name = "nginx-vpc"
+  name = "ngnginx-vpc"
   cidr = "10.0.0.0/16"
 
   azs             = ["us-east-1a", "us-east-1b"]
@@ -35,26 +43,77 @@ module "security_group" {
   egress_rules        = ["all-all"]
 }
 
-resource "aws_instance" "nginx_ec2" {
-  ami                         = "ami-0c02fb55956c7d316" # Amazon Linux 2 AMI (HVM), SSD Volume Type in us-east-1
-  instance_type               = "t3.micro"
-  subnet_id                   = module.vpc.private_subnets[0]
-  vpc_security_group_ids      = [module.security_group.security_group_id]
+resource "aws_launch_configuration" "nginx_lc" {
+  name_prefix   = "nginx-lc-"
+  image_id      = "ami-0c02fb55956c7d316" # Amazon Linux 2
+  instance_type = "t3.micro"
+  security_groups = [module.security_group.security_group_id]
   associate_public_ip_address = false
-  key_name                    = "personal"
-
   user_data = <<-EOF
               #!/bin/bash
               yum update -y
               amazon-linux-extras install docker -y
               service docker start
-              usermod -a -G docker ec2-user
-              docker run -d -p 80:80 ngnix:latest
+              docker run -d -p 80:80 nginx
               EOF
-
-  tags = {
-    Name = "nginx-ec2"
+  lifecycle {
+    create_before_destroy = true
   }
+}
+
+resource "aws_autoscaling_group" "nginx_asg" {
+  name_prefix          = "nginx-asg-"
+  max_size             = 1
+  min_size             = 1
+  desired_capacity     = 1
+  vpc_zone_identifier  = module.vpc.private_subnets
+  launch_configuration = aws_launch_configuration.nginx_lc.name
+
+  tag {
+    key                 = "Name"
+    value               = "nginx-instance"
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_ecs_cluster" "nginx_cluster" {
+  name = "nginx-cluster"
+}
+
+resource "aws_ecs_task_definition" "nginx_task" {
+  family                   = "nginx-task"
+  network_mode             = "bridge"
+  container_definitions    = jsonencode([
+    {
+      name      = "nginx"
+      image     = "nginx:latest"
+      cpu       = 128
+      memory    = 256
+      essential = true
+      portMappings = [
+        {
+          containerPort = 80
+          hostPort      = 80
+        }
+      ]
+    }
+  ])
+  requires_compatibilities = []
+}
+
+resource "aws_ecs_service" "nginx_service" {
+  name            = "nginx-service"
+  cluster         = aws_ecs_cluster.nginx_cluster.id
+  task_definition = aws_ecs_task_definition.nginx_task.arn
+  launch_type     = "EC2"
+  desired_count   = 1
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
+  depends_on = [aws_autoscaling_group.nginx_asg]
 }
 
 resource "aws_lb" "nginx_alb" {
@@ -66,10 +125,10 @@ resource "aws_lb" "nginx_alb" {
 }
 
 resource "aws_lb_target_group" "nginx_tg" {
-  name        = "nginx-tg"
-  port        = 80
-  protocol    = "HTTP"
-  vpc_id      = module.vpc.vpc_id
+  name     = "nginx-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = module.vpc.vpc_id
   target_type = "instance"
 }
 
@@ -82,10 +141,4 @@ resource "aws_lb_listener" "nginx_listener" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.nginx_tg.arn
   }
-}
-
-resource "aws_lb_target_group_attachment" "nginx_target" {
-  target_group_arn = aws_lb_target_group.nginx_tg.arn
-  target_id        = aws_instance.nginx_ec2.id
-  port             = 80
 }
