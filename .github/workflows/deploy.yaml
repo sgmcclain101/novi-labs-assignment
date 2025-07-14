@@ -1,3 +1,4 @@
+// .github/workflows/deploy.yml
 name: Deploy Nginx to AWS
 
 on:
@@ -12,7 +13,7 @@ env:
 
 jobs:
   deploy:
-    name: Provision EC2 with Terraform
+    name: Terraform Deploy
     runs-on: ubuntu-latest
 
     steps:
@@ -33,6 +34,9 @@ jobs:
 
       - name: Terraform Init
         run: terraform init
+
+      - name: Terraform Plan
+        run: terraform plan
 
       - name: Terraform Apply
         run: terraform apply -auto-approve
