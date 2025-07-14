@@ -69,17 +69,8 @@ Edit `main.tf` to use your unique S3 bucket name:
 
 ```hcl
 backend "s3" {
-  bucket = "your-unique-terraform-state-bucket"
+  bucket = "novi-labs-terraform-state-bucket"
   key    = "nginx-app/terraform.tfstate"
   region = "us-east-1"
 }
 ```
-
-### 4. Deploy Infrastructure
-
-#### Option A: Using GitHub Actions (Recommended)
-
-1. Push code to `main` branch
-2. GitHub Actions will automatically:
-   - Run `terraform plan` on PRs
-   - Run `terraform apply
