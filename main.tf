@@ -1,68 +1,177 @@
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  
+  backend "s3" {
+    bucket = "novi-labs-terraform-state-bucket"
+    key    = "nginx-app/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
 provider "aws" {
-  region = "us-east-1"
+  region = var.aws_region
 }
 
-# Data source to get the latest ECS-optimized AMI
-data "aws_ami" "ecs_optimized" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-ecs-hvm-*-x86_64-ebs"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
+# Data sources
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "5.1.2"
+data "aws_caller_identity" "current" {}
 
-  name = "nginx-vpc"
-  cidr = "10.0.0.0/16"
-
-  azs             = ["us-east-1a", "us-east-1b"]
-  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
-  private_subnets = ["10.0.3.0/24", "10.0.4.0/24"]
-
-  enable_nat_gateway = true
-  single_nat_gateway = true
+# VPC
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
-    Project = "nginx-devops"
+    Name        = "${var.project_name}-vpc"
+    Environment = var.environment
   }
 }
 
-module "security_group" {
-  source  = "terraform-aws-modules/security-group/aws"
-  version = "5.1.0"
+# Internet Gateway
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
 
-  name        = "nginx-sg"
-  description = "Allow HTTP and ECS traffic"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress_rules       = ["http-80-tcp"]
-  ingress_cidr_blocks = ["0.0.0.0/0"]
-  
-  # Add egress rules for ECS agent communication
-  egress_rules = ["all-all"]
+  tags = {
+    Name        = "${var.project_name}-igw"
+    Environment = var.environment
+  }
 }
 
-# Additional security group for ECS instances
-resource "aws_security_group" "ecs_instance_sg" {
-  name        = "ecs-instance-sg"
-  description = "Security group for ECS instances"
-  vpc_id      = module.vpc.vpc_id
+# Public Subnets
+resource "aws_subnet" "public" {
+  count = length(var.public_subnet_cidrs)
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name        = "${var.project_name}-public-subnet-${count.index + 1}"
+    Environment = var.environment
+    Type        = "public"
+  }
+}
+
+# Private Subnets
+resource "aws_subnet" "private" {
+  count = length(var.private_subnet_cidrs)
+
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name        = "${var.project_name}-private-subnet-${count.index + 1}"
+    Environment = var.environment
+    Type        = "private"
+  }
+}
+
+# Elastic IP for NAT Gateway
+resource "aws_eip" "nat" {
+  count = length(var.private_subnet_cidrs)
+
+  domain = "vpc"
+  depends_on = [aws_internet_gateway.main]
+
+  tags = {
+    Name        = "${var.project_name}-eip-${count.index + 1}"
+    Environment = var.environment
+  }
+}
+
+# NAT Gateway
+resource "aws_nat_gateway" "main" {
+  count = length(var.private_subnet_cidrs)
+
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name        = "${var.project_name}-nat-gateway-${count.index + 1}"
+    Environment = var.environment
+  }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+# Route Tables
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name        = "${var.project_name}-public-rt"
+    Environment = var.environment
+  }
+}
+
+resource "aws_route_table" "private" {
+  count = length(var.private_subnet_cidrs)
+
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = {
+    Name        = "${var.project_name}-private-rt-${count.index + 1}"
+    Environment = var.environment
+  }
+}
+
+# Route Table Associations
+resource "aws_route_table_association" "public" {
+  count = length(aws_subnet.public)
+
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count = length(aws_subnet.private)
+
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# Security Groups
+resource "aws_security_group" "alb" {
+  name        = "${var.project_name}-alb-sg"
+  description = "Security group for Application Load Balancer"
+  vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port       = 32768
-    to_port         = 65535
-    protocol        = "tcp"
-    security_groups = [module.security_group.security_group_id]
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -73,156 +182,194 @@ resource "aws_security_group" "ecs_instance_sg" {
   }
 
   tags = {
-    Name = "ecs-instance-sg"
+    Name        = "${var.project_name}-alb-sg"
+    Environment = var.environment
   }
 }
 
-resource "aws_iam_role" "ecs_instance_role" {
-  name = "ecsInstanceRole"
+resource "aws_security_group" "ecs_tasks" {
+  name        = "${var.project_name}-ecs-tasks-sg"
+  description = "Security group for ECS tasks"
+  vpc_id      = aws_vpc.main.id
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [{
-      Effect = "Allow",
-      Principal = { Service = "ec2.amazonaws.com" },
-      Action = "sts:AssumeRole"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "ecs_instance_policy" {
-  role       = aws_iam_role.ecs_instance_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
-}
-
-resource "aws_iam_instance_profile" "ecs_instance_profile" {
-  name = "ecsInstanceProfile"
-  role = aws_iam_role.ecs_instance_role.name
-}
-
-resource "aws_launch_template" "ecs_template" {
-  name_prefix   = "ecs-lt-"
-  image_id      = data.aws_ami.ecs_optimized.id
-  instance_type = "t3.micro"
-
-  iam_instance_profile {
-    name = aws_iam_instance_profile.ecs_instance_profile.name
+  ingress {
+    description     = "HTTP from ALB"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
   }
 
-  network_interfaces {
-    associate_public_ip_address = false
-    security_groups             = [aws_security_group.ecs_instance_sg.id]
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    echo "ECS_CLUSTER=${aws_ecs_cluster.nginx_cluster.name}" >> /etc/ecs/ecs.config
-  EOF
-  )
-}
-
-resource "aws_autoscaling_group" "ecs_asg" {
-  name_prefix         = "ecs-asg-"
-  desired_capacity    = 1
-  max_size            = 1
-  min_size            = 1
-  vpc_zone_identifier = module.vpc.private_subnets
-
-  launch_template {
-    id      = aws_launch_template.ecs_template.id
-    version = "$Latest"
-  }
-
-  tag {
-    key                 = "Name"
-    value               = "nginx-ecs-instance"
-    propagate_at_launch = true
-  }
-
-  lifecycle {
-    create_before_destroy = true
+  tags = {
+    Name        = "${var.project_name}-ecs-tasks-sg"
+    Environment = var.environment
   }
 }
 
-resource "aws_ecs_cluster" "nginx_cluster" {
-  name = "nginx-cluster"
-}
-
-resource "aws_ecs_task_definition" "nginx_task" {
-  family                   = "nginx-task"
-  network_mode             = "bridge"
-  container_definitions    = jsonencode([
-    {
-      name      = "nginx"
-      image     = "nginx:latest"
-      cpu       = 128
-      memory    = 256
-      essential = true
-      portMappings = [
-        {
-          containerPort = 80,
-          hostPort      = 0  # Use dynamic port mapping
-        }
-      ]
-    }
-  ])
-  requires_compatibilities = []
-}
-
-resource "aws_lb" "nginx_alb" {
-  name               = "nginx-alb"
+# Application Load Balancer
+resource "aws_lb" "main" {
+  name               = "${var.project_name}-alb"
   internal           = false
   load_balancer_type = "application"
-  subnets            = module.vpc.public_subnets
-  security_groups    = [module.security_group.security_group_id]
-}
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id
 
-resource "aws_lb_target_group" "nginx_tg" {
-  name        = "nginx-tg"
-  port        = 80
-  protocol    = "HTTP"
-  vpc_id      = module.vpc.vpc_id
-  target_type = "instance"
+  enable_deletion_protection = false
 
-  health_check {
-    enabled             = true
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    timeout             = 5
-    interval            = 30
-    path                = "/"
-    matcher             = "200"
+  tags = {
+    Name        = "${var.project_name}-alb"
+    Environment = var.environment
   }
 }
 
-resource "aws_lb_listener" "nginx_listener" {
-  load_balancer_arn = aws_lb.nginx_alb.arn
+# Target Group
+resource "aws_lb_target_group" "app" {
+  name        = "${var.project_name}-tg"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+
+  health_check {
+    healthy_threshold   = "3"
+    interval            = "30"
+    protocol            = "HTTP"
+    matcher             = "200"
+    timeout             = "3"
+    path                = "/"
+    unhealthy_threshold = "2"
+  }
+
+  tags = {
+    Name        = "${var.project_name}-tg"
+    Environment = var.environment
+  }
+}
+
+# Load Balancer Listener
+resource "aws_lb_listener" "front_end" {
+  load_balancer_arn = aws_lb.main.arn
   port              = "80"
   protocol          = "HTTP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.nginx_tg.arn
+    target_group_arn = aws_lb_target_group.app.arn
   }
 }
 
-resource "aws_ecs_service" "nginx_service" {
-  name            = "nginx-service"
-  cluster         = aws_ecs_cluster.nginx_cluster.id
-  task_definition = aws_ecs_task_definition.nginx_task.arn
-  launch_type     = "EC2"
-  desired_count   = 1
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "app_logs" {
+  name              = "/ecs/${var.project_name}"
+  retention_in_days = 7
+
+  tags = {
+    Name        = "${var.project_name}-logs"
+    Environment = var.environment
+  }
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = "${var.project_name}-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = {
+    Name        = "${var.project_name}-cluster"
+    Environment = var.environment
+  }
+}
+
+# ECS Task Definition
+resource "aws_ecs_task_definition" "app" {
+  family                   = "${var.project_name}-app"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = var.fargate_cpu
+  memory                   = var.fargate_memory
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name  = "${var.project_name}-app"
+      image = "nginx:latest"
+      
+      essential = true
+      
+      portMappings = [
+        {
+          containerPort = 80
+          protocol      = "tcp"
+        }
+      ]
+      
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.app_logs.name
+          awslogs-region        = var.aws_region
+          awslogs-stream-prefix = "ecs"
+        }
+      }
+      
+      healthCheck = {
+        command = [
+          "CMD-SHELL",
+          "curl -f http://localhost/ || exit 1"
+        ]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 60
+      }
+    }
+  ])
+
+  tags = {
+    Name        = "${var.project_name}-task-definition"
+    Environment = var.environment
+  }
+}
+
+# ECS Service
+resource "aws_ecs_service" "main" {
+  name            = "${var.project_name}-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = var.app_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    subnets          = aws_subnet.private[*].id
+    assign_public_ip = false
+  }
 
   load_balancer {
-    target_group_arn = aws_lb_target_group.nginx_tg.arn
-    container_name   = "nginx"
+    target_group_arn = aws_lb_target_group.app.arn
+    container_name   = "${var.project_name}-app"
     container_port   = 80
   }
 
-  depends_on = [aws_lb_listener.nginx_listener]
-}
+  depends_on = [
+    aws_lb_listener.front_end,
+    aws_iam_role_policy_attachment.ecs_task_execution_role,
+  ]
 
-output "alb_dns_name" {
-  value       = aws_lb.nginx_alb.dns_name
-  description = "DNS name of the Application Load Balancer"
+  tags = {
+    Name        = "${var.project_name}-service"
+    Environment = var.environment
+  }
 }
