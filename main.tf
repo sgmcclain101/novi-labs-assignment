@@ -3,15 +3,6 @@ provider "aws" {
   region = "us-east-1"
 }
 
-resource "aws_ecr_repository" "nginx" {
-  name                 = "nginx-devops"
-  image_tag_mutability = "MUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-}
-
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.1.2"
@@ -50,7 +41,7 @@ resource "aws_instance" "nginx_ec2" {
   subnet_id                   = module.vpc.private_subnets[0]
   vpc_security_group_ids      = [module.security_group.security_group_id]
   associate_public_ip_address = false
-  key_name                    = "your-key-name" # replace with your key name
+  key_name                    = "personal"
 
   user_data = <<-EOF
               #!/bin/bash
